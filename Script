@@ -1,0 +1,234 @@
+# LIBRARY
+import googlemaps
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from datetime import datetime
+import pathlib
+import asyncio
+import json
+import aiohttp
+from tasks import tasks
+
+# PARAMETERS
+
+connections = None
+current_date = None
+
+# CONECTION
+connections = tasks.LoadConnections(connections).load(
+    root_path_connections=pathlib.Path(".").resolve().parent.parent.parent
+    / ".connections.json"
+)
+
+# START SPARK
+spark = (
+    tasks
+    .StartSparkSession(
+        access_key=connections.dl_connection.access_key,
+        secret_key=connections.dl_connection.secret_key,
+        endpoint=connections.dl_connection.endpoint,
+        app_name='load maps info'
+    )
+    .run()
+)
+
+# DATABASE
+df_pessoas = (
+    spark
+    .read
+    .format('csv')
+    .option('header', 'true')
+    .load('s3a://TMP/TMP_DADOS_PESSOAS.csv')
+)
+
+
+# TRANSFORM DATABASE
+df1 = (
+    df_pessoas
+    .withColumn(
+        "LOGRADOURO",
+        F.when(F.col("LOGRADOURO").isNull(), " ").otherwise(F.col("LOGRADOURO"))
+    )
+    .withColumn(
+        "NÚMERO",
+        F.when(F.col("NÚMERO").isNull(), " ").otherwise(F.col("NÚMERO"))
+    )
+    .withColumn(
+        "BAIRRO",
+        F.when(F.col("BAIRRO").isNull(), " ").otherwise(F.col("BAIRRO"))
+    )
+    .withColumn(
+        "MUNICÍPIO",
+        F.when(F.col("MUNICÍPIO").isNull(), " ").otherwise(F.col("MUNICÍPIO"))
+    )
+    .withColumn(
+        "UF",
+        F.when(F.col("UF").isNull(), " ").otherwise(F.col("UF"))
+    )
+)
+
+
+df2 = (
+    df1
+    .withColumn(
+        "ENDERECO",
+        F.upper(
+            F.concat(
+                "LOGRADOURO",
+                F.lit(", "),
+                "NÚMERO",
+                F.lit(", "),
+                "BAIRRO",
+                F.lit(", "),
+                "MUNICÍPIO",
+                F.when(F.col("UF") == " ", " ")
+                    .otherwise(
+                        F.concat(
+                            F.lit("/")
+                            ,F.col("UF") 
+                            )
+                    ) 
+            )
+        ),
+    )
+    .withColumn("CEP", F.regexp_replace("CEP",r'-', ''))
+    .select("CEP", "ENDERECO")
+    .distinct()
+)
+
+df3 = (
+    df2
+    .where("LOGRADOURO IS NOT NULL" )
+)
+
+records = (
+    df3
+    .rdd
+    .map(lambda row: row.asDict())
+    .collect()
+)
+
+
+# API
+async def fetch(session, record):
+    
+    url = "https://maps.googleapis.com/maps/api/geocode/json?key=CHAVE"
+    async with session.get(
+        url=url,
+        params={
+            "address": record["ENDERECO"],
+            "language": "pt-br",
+        },
+    ) as response:
+        
+        response = await response.json()
+        
+        results = response['results']
+        
+        for result in results:
+            result['CEP'] = record["CEP"]
+        
+        return results
+
+async def main(records):
+    
+    responses = []
+    timeout = aiohttp.ClientTimeout(total=6 * 10 * 720)
+    
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        requests = [fetch(session, record) for record in records]
+        response = await asyncio.gather(*requests)
+        responses.extend(response)
+
+    return responses
+
+# EXECUTE API FUNCTION
+data = await main(records)
+
+# TAKE THE RESULTS
+data_s = [
+            e
+            for d in data
+            for e in d
+        ]
+
+fields1 = [T.StructField(column, T.StringType()) for column in data_s[0].keys()]
+schema1 = T.StructType(fields1)
+
+dfg = spark.createDataFrame(data_s, schema=schema1)
+
+
+# SAVE API RESULTS
+dfg.write.format('parquet').save("/home/user/dags-fontes/.tmp/google_result.parquet")
+
+
+# SAVE API RESULTS
+lista = []
+
+# TRANSFORM THE RESULTS
+for resultado in data:
+    # print(len(resultado))
+    for dado in resultado:
+        address_components = dado['address_components']
+        ip = {
+            "cd_cep": dado['CEP'], 
+            'ds_enderecoformatado': dado['formatted_address'],
+            'nr_latitude': dado['geometry']['location']['lat'],
+            'nr_longitude': dado['geometry']['location']['lng'],
+        }
+            
+        for a in address_components:
+            if 'postal_code' in a['types']:
+                ip['cd_cep_google'] = a['long_name']
+        lista.append(ip)
+
+fields = [T.StructField(column, T.StringType()) for column in lista[0].keys()]
+schema = T.StructType(fields)
+
+df = spark.createDataFrame(lista, schema=schema)
+
+text_columns = {
+    'cd_cep': F.regexp_replace(F.trim("cd_cep"),r'-',''),
+    'cd_cep_google': F.regexp_replace(F.trim("cd_cep_google"),r'-',''),
+    'ds_enderecoformatado': F.upper(F.trim("ds_enderecoformatado")),
+}
+
+decimal_columns = {   
+    'nr_latitude': F.col("nr_latitude").cast(T.DecimalType(10, 8)),
+    'nr_longitude': F.col("nr_longitude").cast(T.DecimalType(10, 8)),
+}
+
+dff = (
+    df
+    .withColumns(
+        {
+            **text_columns,
+            **decimal_columns,
+        }).withColumnsRenamed(
+    {
+        "cd_cep": "cd_ceporiginal",
+        "ds_enderecoformatado": "ds_endereco",
+        'cd_cep_google': "cd_cepgoogle",
+    }
+    )
+)
+
+frecords = dff.rdd.map(lambda row: row.asDict()).collect()
+
+# SAVE THE RESULTS
+(
+    tasks
+    .WriteSqlServerTable(
+        username=connections.dw_connection.username,
+        password=connections.dw_connection.password,
+        host=connections.dw_connection.host,
+        database=connections.dw_connection.database,
+        schema="DW",
+        table="dim_cep",
+        truncate_table=True,
+    )
+    .load(frecords)
+)
+
+# STOP SPARK
+spark.stop()
