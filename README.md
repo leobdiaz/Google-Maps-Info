@@ -1,0 +1,1 @@
+The script takes the address from a group of people in CSV and execute the API of Google Maps to extract the formated address and the Latitude and Longitude, in order to calculate the distance between addresses.
